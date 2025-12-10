@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==========================================
-# Linux 端口限速工具 (循环菜单 + Bug修复版)
+# Linux 端口限速工具 (v4 - 支持小数版)
 # ==========================================
 
 CONFIG_DIR="/etc/port-limit"
@@ -36,6 +36,7 @@ check_dependencies() {
     local missing=()
     [ ! -x "$(command -v tc)" ] && missing+=("iproute2")
     [ ! -x "$(command -v iptables)" ] && missing+=("iptables")
+    [ ! -x "$(command -v awk)" ] && missing+=("awk") # 增加 awk 检查
     
     if [ ${#missing[@]} -ne 0 ]; then
         if [ -x "$(command -v apt)" ]; then apt update && apt install -y "${missing[@]}"; 
@@ -49,8 +50,9 @@ init_config() {
     touch "$LOG_FILE"
 }
 
+# 验证数字 (支持整数和小数，如 0.5, 10.5)
 validate_number() {
-    [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -gt 0 ]
+    [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]] && (( $(echo "$1 > 0" | bc -l 2>/dev/null || awk "{if($1>0) print 1; else print 0}") ))
 }
 
 # 暂停并按回车继续
@@ -63,11 +65,8 @@ pause() {
 
 remove_rules() {
     local quiet=$1
-    # 临时读取旧配置来删除规则，使用局部变量避免污染全局
     if [ -f "$CONFIG_FILE" ]; then
-        # 仅读取 PORTS 变量，不 source 整个文件，防止覆盖
         local OLD_PORTS=$(grep "^PORTS=" "$CONFIG_FILE" | cut -d'=' -f2)
-        
         if [ -n "$OLD_PORTS" ]; then
             IFS=',' read -ra PORT_ARR <<< "$OLD_PORTS"
             for PORT in "${PORT_ARR[@]}"; do
@@ -99,35 +98,34 @@ set_limit() {
     read -p "请输入端口 (逗号分隔): " INPUT_PORTS
     [ -z "$INPUT_PORTS" ] && return
     
-    # 使用明确的变量名 INPUT_MB
-    read -p "请输入限制速率 (单位 MB/s, 仅输入整数): " INPUT_MB
-    if ! validate_number "$INPUT_MB"; then echo "数值无效"; return; fi
+    # 允许小数输入
+    read -p "请输入限制速率 (单位 MB/s, 支持小数, 如 0.5): " INPUT_MB
+    if ! validate_number "$INPUT_MB"; then echo "数值无效 (必须大于0)"; return; fi
     
-    # --- 计算区 ---
-    local LIMIT_KB=$((INPUT_MB * 1024))
-    local SHOW_MBPS=$((INPUT_MB * 8))
+    # --- 使用 AWK 进行浮点运算 ---
+    # LIMIT_KB: 将 MB 转换为 KB，取整数部分给 tc 使用
+    local LIMIT_KB=$(awk -v val="$INPUT_MB" 'BEGIN {printf "%d", val * 1024}')
+    # SHOW_MBPS: 转换为 Mbps 用于显示
+    local SHOW_MBPS=$(awk -v val="$INPUT_MB" 'BEGIN {printf "%.2f", val * 8}')
     
-    # 将物理总带宽限制设为 1000MB/s (1Gbps)
+    # 防止计算结果为 0 (例如输入 0.0001)
+    if [ "$LIMIT_KB" -lt 1 ]; then LIMIT_KB=1; fi
+
+    # 物理带宽 1000MB/s (1Gbps)
     local PHY_LIMIT=$((1000 * 1024)) 
     
-    # 清理旧规则 (此时不会再覆盖 INPUT_MB)
     remove_rules "quiet"
     
     # --- TC 规则区 ---
-    
-    # 1. Root
     tc qdisc add dev "$INTERFACE" root handle 1: htb default 30
-    
-    # 2. 主类 (1:1): 增加 quantum 200000 消除 "quantum is big" 警告
     tc class add dev "$INTERFACE" parent 1: classid 1:1 htb rate "${PHY_LIMIT}kbps" quantum 200000
     
-    # 3. 限速类 (1:10): 目标端口
+    # 限速类
     tc class add dev "$INTERFACE" parent 1: classid 1:10 htb rate "${LIMIT_KB}kbps" ceil "${LIMIT_KB}kbps" burst 15k quantum 3000 prio 1
     
-    # 4. 默认畅通类 (1:30): 其他端口
+    # 默认畅通类
     tc class add dev "$INTERFACE" parent 1: classid 1:30 htb rate "${PHY_LIMIT}kbps" ceil "${PHY_LIMIT}kbps" burst 15k quantum 200000 prio 0
     
-    # 5. 过滤器
     tc filter add dev "$INTERFACE" protocol ip parent 1:0 prio 1 handle $MARK fw flowid 1:10
     tc filter add dev "$INTERFACE" protocol ipv6 parent 1:0 prio 1 handle $MARK fw flowid 1:10 2>/dev/null
 
@@ -137,17 +135,15 @@ set_limit() {
         add_firewall_rules "$PORT"
     done
     
-    # 保存配置
     cat > "$CONFIG_FILE" << EOF
 PORTS=$INPUT_PORTS
 LIMIT_MB=$INPUT_MB
 EOF
     
-    log "已限速: 端口 [$INPUT_PORTS] -> $INPUT_MB MB/s"
+    log "已限速: 端口 [$INPUT_PORTS] -> $INPUT_MB MB/s ($LIMIT_KB KB/s)"
     echo -e "${GREEN}设置成功！${PLAIN}"
-    echo -e "当前限制: ${YELLOW}$INPUT_MB MB/s${PLAIN} (相当于约 ${YELLOW}$SHOW_MBPS Mbps${PLAIN})"
+    echo -e "当前限制: ${YELLOW}$INPUT_MB MB/s${PLAIN} (约 $SHOW_MBPS Mbps)"
     
-    # 暂停
     pause
 }
 
@@ -156,14 +152,14 @@ show_status() {
     if [ -f "$CONFIG_FILE" ]; then
         source "$CONFIG_FILE"
         echo "监听端口: $PORTS"
-        local CUR_MBPS=$((LIMIT_MB * 8))
+        # 重新计算显示
+        local CUR_MBPS=$(awk -v val="$LIMIT_MB" 'BEGIN {printf "%.2f", val * 8}')
         echo "限制速率: $LIMIT_MB MB/s (约 $CUR_MBPS Mbps)"
     else
         echo "无配置文件"
     fi
     
     echo -e "\n${YELLOW}--- 流量统计 ---${PLAIN}"
-    # 显示类 1:10 (限速类) 的信息
     tc -s class show dev "$INTERFACE" | grep -A 5 "class htb 1:10"
     
     echo -e "\n${YELLOW}--- 命中包数 (pkts) ---${PLAIN}"
@@ -179,7 +175,6 @@ clear_all() {
     pause
 }
 
-# --- 循环主菜单 ---
 main() {
     check_root
     check_dependencies
@@ -188,10 +183,10 @@ main() {
     while true; do
         clear
         echo "=================================="
-        echo "    Linux 端口限速工具 (Pro)      "
+        echo "    Linux 端口限速工具 (小数版)   "
         echo "    当前网卡: $INTERFACE          "
         echo "=================================="
-        echo " 1. 设置/更新 端口限速 (MB/s)"
+        echo " 1. 设置/更新 端口限速 (支持小数)"
         echo " 2. 查看状态 (排查故障)"
         echo " 3. 清除限制"
         echo " 0. 退出"
