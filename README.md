@@ -21,7 +21,7 @@
 ## 快速安装
 使用以下命令一键安装并运行：
 ```bash
-sudo bash -c "wget -O Throttle.sh https://raw.githubusercontent.com/suxayii/vps-port-speed-limit/main/Throttle.sh && chmod +x Throttle.sh && bash Throttle.sh"
+sudo bash -c "wget -O Throttle.sh https://github.com/suxayii/vps-port-speed-limit/raw/refs/heads/master/Throttle.sh && chmod +x Throttle.sh && bash Throttle.sh"
 ```
 
 ## 使用说明
