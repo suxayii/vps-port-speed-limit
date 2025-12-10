@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==========================================
-# Linux 端口限速工具 (修复 r2q 警告版)
+# Linux 端口限速工具 (最终完美版 v3)
 # ==========================================
 
 CONFIG_DIR="/etc/port-limit"
@@ -93,40 +93,42 @@ set_limit() {
     read -p "请输入限制速率 (单位 MB/s, 仅输入整数): " LIMIT_MB
     if ! validate_number "$LIMIT_MB"; then echo "数值无效"; return; fi
     
-    # 转换计算
+    # --- 计算区 ---
     local LIMIT_KB=$((LIMIT_MB * 1024))
-    # 换算成 Mbps 用于显示给用户对比
     local SHOW_MBPS=$((LIMIT_MB * 8))
     
-    # 物理带宽设为 10GB/s
-    local PHY_LIMIT=$((10 * 1024 * 1024)) 
+    # 将物理总带宽限制设为 1000MB/s (1Gbps)，避免 10G 时计算 quantum 溢出报警
+    # 这对于绝大多数 VPS 来说已经算是"不限速"了
+    local PHY_LIMIT=$((1000 * 1024)) 
     
     remove_rules "quiet"
     
-    # 1. TC 根队列 (添加 r2q 这里的 r2q 参数有助于避免警告，但后面我们会手动指定 quantum)
-    tc qdisc add dev "$INTERFACE" root handle 1: htb default 30 r2q 10
+    # --- TC 规则区 (核心修复) ---
     
-    # 2. 总带宽类
-    tc class add dev "$INTERFACE" parent 1: classid 1:1 htb rate "${PHY_LIMIT}kbps"
+    # 1. Root: 这里 r2q=10 是默认值，不用改，因为我们在下面手动指定了 quantum
+    tc qdisc add dev "$INTERFACE" root handle 1: htb default 30
     
-    # 3. 限速类 (1:10) - 增加 burst 和 quantum 参数修复警告
-    # burst: 允许突发的大小，通常设为 15k-30k 左右
-    # quantum: 设为 MTU 左右的值 (如 1500-3000)
+    # 2. 主类 (1:1): 关键修复！增加 quantum 50000 防止警告
+    tc class add dev "$INTERFACE" parent 1: classid 1:1 htb rate "${PHY_LIMIT}kbps" quantum 50000
+    
+    # 3. 限速类 (1:10): 你的目标端口
+    # quantum 设为 3000 (约为 2个 MTU)，burst 设为 15k 允许小突发
     tc class add dev "$INTERFACE" parent 1:1 classid 1:10 htb rate "${LIMIT_KB}kbps" ceil "${LIMIT_KB}kbps" burst 15k quantum 3000 prio 1
     
-    # 4. 默认畅通类 (1:30)
+    # 4. 默认畅通类 (1:30): 其他端口 (SSH等)
     tc class add dev "$INTERFACE" parent 1:1 classid 1:30 htb rate "${PHY_LIMIT}kbps" ceil "${PHY_LIMIT}kbps" burst 15k quantum 3000 prio 0
     
     # 5. 过滤器
     tc filter add dev "$INTERFACE" protocol ip parent 1:0 prio 1 handle $MARK fw flowid 1:10
     tc filter add dev "$INTERFACE" protocol ipv6 parent 1:0 prio 1 handle $MARK fw flowid 1:10 2>/dev/null
 
-    # 6. 防火墙打标
+    # --- 防火墙区 ---
     IFS=',' read -ra PORT_ARR <<< "$INPUT_PORTS"
     for PORT in "${PORT_ARR[@]}"; do
         add_firewall_rules "$PORT"
     done
     
+    # 保存配置
     cat > "$CONFIG_FILE" << EOF
 PORTS=$INPUT_PORTS
 LIMIT_MB=$LIMIT_MB
@@ -134,20 +136,27 @@ EOF
     
     log "已限速: 端口 [$INPUT_PORTS] -> $LIMIT_MB MB/s"
     echo -e "${GREEN}设置成功！${PLAIN}"
-    echo -e "当前限制物理速度: ${YELLOW}$LIMIT_MB MB/s${PLAIN}"
-    echo -e "对应测速网站读数: ${YELLOW}约 $SHOW_MBPS Mbps${PLAIN}"
-    echo -e "(如果你的测速结果小于 $SHOW_MBPS，说明并未达到限速阈值)"
+    echo -e "当前限制: ${YELLOW}$LIMIT_MB MB/s${PLAIN} (相当于约 ${YELLOW}$SHOW_MBPS Mbps${PLAIN})"
+    echo -e "请进行测速，结果应在 $SHOW_MBPS Mbps 左右。"
 }
 
 show_status() {
     echo -e "${YELLOW}--- 当前配置 ($INTERFACE) ---${PLAIN}"
-    [ -f "$CONFIG_FILE" ] && cat "$CONFIG_FILE"
+    if [ -f "$CONFIG_FILE" ]; then
+        source "$CONFIG_FILE"
+        echo "监听端口: $PORTS"
+        local CUR_MBPS=$((LIMIT_MB * 8))
+        echo "限制速率: $LIMIT_MB MB/s (约 $CUR_MBPS Mbps)"
+    else
+        echo "无配置文件"
+    fi
     
-    echo -e "\n${YELLOW}--- TC 流量统计 (Sent = 已发送字节) ---${PLAIN}"
+    echo -e "\n${YELLOW}--- 流量命中统计 ---${PLAIN}"
+    echo "Sent bytes = 经过限速的流量总大小"
     tc -s class show dev "$INTERFACE" | grep -A 5 "class htb 1:10"
     
-    echo -e "\n${YELLOW}--- 防火墙命中统计 (pkts = 命中包数) ---${PLAIN}"
-    echo "如果是 0 pkts，说明流量没有走这些端口，或者被其他规则拦截。"
+    echo -e "\n${YELLOW}--- 包捕获统计 (pkts) ---${PLAIN}"
+    echo "若 pkts 持续增长，说明规则生效中"
     iptables -t mangle -L OUTPUT -v -n | grep "MARK set 0x$((MARK))"
 }
 
@@ -162,7 +171,7 @@ main() {
     check_dependencies
     init_config
     echo "1. 设置端口限速 (MB/s)"
-    echo "2. 查看状态 (排查故障)"
+    echo "2. 查看状态"
     echo "3. 清除限制"
     echo "0. 退出"
     read -p "选择: " OPT
