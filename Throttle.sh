@@ -1,10 +1,9 @@
 #!/bin/bash
 
 # ==========================================
-# Linux 端口限速工具 (MB/s 版 | IPv4+IPv6)
+# Linux 端口限速工具 (修复 r2q 警告版)
 # ==========================================
 
-# --- 配置区 ---
 CONFIG_DIR="/etc/port-limit"
 CONFIG_FILE="$CONFIG_DIR/settings.conf"
 LOG_FILE="$CONFIG_DIR/port-limit.log"
@@ -39,15 +38,9 @@ check_dependencies() {
     [ ! -x "$(command -v iptables)" ] && missing+=("iptables")
     
     if [ ${#missing[@]} -ne 0 ]; then
-        echo -e "${YELLOW}正在安装依赖...${PLAIN}"
-        if [ -x "$(command -v apt)" ]; then
-            apt update && apt install -y "${missing[@]}"
-        elif [ -x "$(command -v yum)" ]; then
-            yum install -y "${missing[@]}"
-        else
-            echo -e "${RED}请手动安装: ${missing[*]}${PLAIN}"
-            exit 1
-        fi
+        if [ -x "$(command -v apt)" ]; then apt update && apt install -y "${missing[@]}"; 
+        elif [ -x "$(command -v yum)" ]; then yum install -y "${missing[@]}"; 
+        else echo "请手动安装: ${missing[*]}"; exit 1; fi
     fi
 }
 
@@ -64,17 +57,13 @@ validate_number() {
 
 remove_rules() {
     local quiet=$1
-    
     if [ -f "$CONFIG_FILE" ]; then
         source "$CONFIG_FILE"
         if [ -n "$PORTS" ]; then
             IFS=',' read -ra PORT_ARR <<< "$PORTS"
             for PORT in "${PORT_ARR[@]}"; do
-                # IPv4
                 iptables -t mangle -D OUTPUT -o "$INTERFACE" -p tcp --sport "$PORT" -j MARK --set-mark $MARK 2>/dev/null
                 iptables -t mangle -D OUTPUT -o "$INTERFACE" -p udp --sport "$PORT" -j MARK --set-mark $MARK 2>/dev/null
-                
-                # IPv6
                 if [ -x "$(command -v ip6tables)" ]; then
                     ip6tables -t mangle -D OUTPUT -o "$INTERFACE" -p tcp --sport "$PORT" -j MARK --set-mark $MARK 2>/dev/null
                     ip6tables -t mangle -D OUTPUT -o "$INTERFACE" -p udp --sport "$PORT" -j MARK --set-mark $MARK 2>/dev/null
@@ -82,7 +71,6 @@ remove_rules() {
             done
         fi
     fi
-
     tc qdisc del dev "$INTERFACE" root 2>/dev/null
     [ "$quiet" != "quiet" ] && log "旧规则已清理"
 }
@@ -91,7 +79,6 @@ add_firewall_rules() {
     local port=$1
     iptables -t mangle -A OUTPUT -o "$INTERFACE" -p tcp --sport "$port" -j MARK --set-mark $MARK
     iptables -t mangle -A OUTPUT -o "$INTERFACE" -p udp --sport "$port" -j MARK --set-mark $MARK
-    
     if [ -f /proc/net/if_inet6 ] && [ -x "$(command -v ip6tables)" ]; then
         ip6tables -t mangle -A OUTPUT -o "$INTERFACE" -p tcp --sport "$port" -j MARK --set-mark $MARK 2>/dev/null
         ip6tables -t mangle -A OUTPUT -o "$INTERFACE" -p udp --sport "$port" -j MARK --set-mark $MARK 2>/dev/null
@@ -103,30 +90,32 @@ set_limit() {
     read -p "请输入端口 (逗号分隔): " INPUT_PORTS
     [ -z "$INPUT_PORTS" ] && return
     
-    # === 修改点：单位改为 MB ===
     read -p "请输入限制速率 (单位 MB/s, 仅输入整数): " LIMIT_MB
     if ! validate_number "$LIMIT_MB"; then echo "数值无效"; return; fi
     
-    # 转换为 KB (1 MB = 1024 KB)
+    # 转换计算
     local LIMIT_KB=$((LIMIT_MB * 1024))
+    # 换算成 Mbps 用于显示给用户对比
+    local SHOW_MBPS=$((LIMIT_MB * 8))
     
-    # 物理带宽设为 10GB/s (单位 KBps) 保证非限速端口畅通
+    # 物理带宽设为 10GB/s
     local PHY_LIMIT=$((10 * 1024 * 1024)) 
     
     remove_rules "quiet"
     
-    # 1. TC 根队列
-    tc qdisc add dev "$INTERFACE" root handle 1: htb default 30
+    # 1. TC 根队列 (添加 r2q 这里的 r2q 参数有助于避免警告，但后面我们会手动指定 quantum)
+    tc qdisc add dev "$INTERFACE" root handle 1: htb default 30 r2q 10
     
     # 2. 总带宽类
     tc class add dev "$INTERFACE" parent 1: classid 1:1 htb rate "${PHY_LIMIT}kbps"
     
-    # 3. 限速类 (1:10) - 使用转换后的 KB 数值
-    # 注意: tc 的 kbps = kilobytes per second
-    tc class add dev "$INTERFACE" parent 1:1 classid 1:10 htb rate "${LIMIT_KB}kbps" ceil "${LIMIT_KB}kbps" prio 1
+    # 3. 限速类 (1:10) - 增加 burst 和 quantum 参数修复警告
+    # burst: 允许突发的大小，通常设为 15k-30k 左右
+    # quantum: 设为 MTU 左右的值 (如 1500-3000)
+    tc class add dev "$INTERFACE" parent 1:1 classid 1:10 htb rate "${LIMIT_KB}kbps" ceil "${LIMIT_KB}kbps" burst 15k quantum 3000 prio 1
     
     # 4. 默认畅通类 (1:30)
-    tc class add dev "$INTERFACE" parent 1:1 classid 1:30 htb rate "${PHY_LIMIT}kbps" ceil "${PHY_LIMIT}kbps" prio 0
+    tc class add dev "$INTERFACE" parent 1:1 classid 1:30 htb rate "${PHY_LIMIT}kbps" ceil "${PHY_LIMIT}kbps" burst 15k quantum 3000 prio 0
     
     # 5. 过滤器
     tc filter add dev "$INTERFACE" protocol ip parent 1:0 prio 1 handle $MARK fw flowid 1:10
@@ -138,30 +127,28 @@ set_limit() {
         add_firewall_rules "$PORT"
     done
     
-    # 保存配置
     cat > "$CONFIG_FILE" << EOF
 PORTS=$INPUT_PORTS
 LIMIT_MB=$LIMIT_MB
-LIMIT_KB=$LIMIT_KB
 EOF
     
-    log "已限速: 端口 [$INPUT_PORTS] -> $LIMIT_MB MB/s ($LIMIT_KB KB/s)"
-    echo -e "${GREEN}设置成功！当前限制: $LIMIT_MB MB/s${PLAIN}"
+    log "已限速: 端口 [$INPUT_PORTS] -> $LIMIT_MB MB/s"
+    echo -e "${GREEN}设置成功！${PLAIN}"
+    echo -e "当前限制物理速度: ${YELLOW}$LIMIT_MB MB/s${PLAIN}"
+    echo -e "对应测速网站读数: ${YELLOW}约 $SHOW_MBPS Mbps${PLAIN}"
+    echo -e "(如果你的测速结果小于 $SHOW_MBPS，说明并未达到限速阈值)"
 }
 
 show_status() {
-    echo -e "${YELLOW}--- 当前状态 ($INTERFACE) ---${PLAIN}"
-    if [ -f "$CONFIG_FILE" ]; then
-        source "$CONFIG_FILE"
-        echo -e "当前配置端口: ${GREEN}$PORTS${PLAIN}"
-        echo -e "当前限制速率: ${GREEN}$LIMIT_MB MB/s${PLAIN} ($LIMIT_KB KB/s)"
-    else
-        echo "无配置文件"
-    fi
+    echo -e "${YELLOW}--- 当前配置 ($INTERFACE) ---${PLAIN}"
+    [ -f "$CONFIG_FILE" ] && cat "$CONFIG_FILE"
     
-    echo -e "\n${YELLOW}--- TC 流量统计 ---${PLAIN}"
-    # 显示限速类 1:10 的统计信息
+    echo -e "\n${YELLOW}--- TC 流量统计 (Sent = 已发送字节) ---${PLAIN}"
     tc -s class show dev "$INTERFACE" | grep -A 5 "class htb 1:10"
+    
+    echo -e "\n${YELLOW}--- 防火墙命中统计 (pkts = 命中包数) ---${PLAIN}"
+    echo "如果是 0 pkts，说明流量没有走这些端口，或者被其他规则拦截。"
+    iptables -t mangle -L OUTPUT -v -n | grep "MARK set 0x$((MARK))"
 }
 
 clear_all() {
@@ -170,14 +157,12 @@ clear_all() {
     echo -e "${GREEN}已清除所有限制。${PLAIN}"
 }
 
-# --- 菜单 ---
 main() {
     check_root
     check_dependencies
     init_config
-    
     echo "1. 设置端口限速 (MB/s)"
-    echo "2. 查看状态"
+    echo "2. 查看状态 (排查故障)"
     echo "3. 清除限制"
     echo "0. 退出"
     read -p "选择: " OPT
