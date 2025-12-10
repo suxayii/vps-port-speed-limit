@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==========================================
-# Linux 端口限速工具 (v5 - 防卡死修复版)
+# Linux 端口限速工具 (v6 - 终极防卡死版)
 # ==========================================
 
 CONFIG_DIR="/etc/port-limit"
@@ -50,18 +50,16 @@ init_config() {
     touch "$LOG_FILE"
 }
 
-# --- 修复核心：全新的数字验证函数 ---
+# --- 核心修复：添加 < /dev/null ---
+# 强制切断输入流，防止 awk 等待导致卡死
 validate_number() {
     local input=$1
-    # 1. 先用正则判断是不是纯数字或小数
     if [[ ! "$input" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
         return 1
     fi
-    # 2. 使用 awk 的 BEGIN 模块直接计算，不需要读取 stdin，绝对不会卡死
-    awk -v val="$input" 'BEGIN { if (val > 0) exit 0; else exit 1 }'
+    awk -v val="$input" 'BEGIN { if (val > 0) exit 0; else exit 1 }' < /dev/null
 }
 
-# 暂停并按回车继续
 pause() {
     echo ""
     read -p "按回车键返回主菜单..."
@@ -107,16 +105,15 @@ set_limit() {
     # 允许小数输入
     read -p "请输入限制速率 (单位 MB/s, 支持小数, 如 0.5): " INPUT_MB
     
-    # 调用新的验证函数
     if ! validate_number "$INPUT_MB"; then 
         echo -e "${RED}错误：数值无效 (必须是大于0的数字)${PLAIN}"
         pause
         return
     fi
     
-    # --- 使用 AWK 进行浮点运算 ---
-    local LIMIT_KB=$(awk -v val="$INPUT_MB" 'BEGIN {printf "%d", val * 1024}')
-    local SHOW_MBPS=$(awk -v val="$INPUT_MB" 'BEGIN {printf "%.2f", val * 8}')
+    # --- 修复核心：所有计算命令强制不等待输入 ---
+    local LIMIT_KB=$(awk -v val="$INPUT_MB" 'BEGIN {printf "%d", val * 1024}' < /dev/null)
+    local SHOW_MBPS=$(awk -v val="$INPUT_MB" 'BEGIN {printf "%.2f", val * 8}' < /dev/null)
     
     if [ "$LIMIT_KB" -lt 1 ]; then LIMIT_KB=1; fi
     local PHY_LIMIT=$((1000 * 1024)) 
@@ -155,7 +152,7 @@ show_status() {
     if [ -f "$CONFIG_FILE" ]; then
         source "$CONFIG_FILE"
         echo "监听端口: $PORTS"
-        local CUR_MBPS=$(awk -v val="$LIMIT_MB" 'BEGIN {printf "%.2f", val * 8}')
+        local CUR_MBPS=$(awk -v val="$LIMIT_MB" 'BEGIN {printf "%.2f", val * 8}' < /dev/null)
         echo "限制速率: $LIMIT_MB MB/s (约 $CUR_MBPS Mbps)"
     else
         echo "无配置文件"
@@ -181,14 +178,12 @@ main() {
     check_root
     check_dependencies
     init_config
-    
-    # 捕获 Ctrl+C 信号，防止脚本意外终止后残留
     trap "exit 1" INT
 
     while true; do
         clear
         echo "=================================="
-        echo "    Linux 端口限速工具 (v5 修复版)"
+        echo "    Linux 端口限速工具 (v6)"
         echo "    当前网卡: $INTERFACE          "
         echo "=================================="
         echo " 1. 设置/更新 端口限速 (支持小数)"
