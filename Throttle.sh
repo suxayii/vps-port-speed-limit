@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==========================================
-# Linux 端口限速工具 (v4 - 支持小数版)
+# Linux 端口限速工具 (v5 - 防卡死修复版)
 # ==========================================
 
 CONFIG_DIR="/etc/port-limit"
@@ -36,7 +36,7 @@ check_dependencies() {
     local missing=()
     [ ! -x "$(command -v tc)" ] && missing+=("iproute2")
     [ ! -x "$(command -v iptables)" ] && missing+=("iptables")
-    [ ! -x "$(command -v awk)" ] && missing+=("awk") # 增加 awk 检查
+    [ ! -x "$(command -v awk)" ] && missing+=("awk")
     
     if [ ${#missing[@]} -ne 0 ]; then
         if [ -x "$(command -v apt)" ]; then apt update && apt install -y "${missing[@]}"; 
@@ -50,9 +50,15 @@ init_config() {
     touch "$LOG_FILE"
 }
 
-# 验证数字 (支持整数和小数，如 0.5, 10.5)
+# --- 修复核心：全新的数字验证函数 ---
 validate_number() {
-    [[ "$1" =~ ^[0-9]+(\.[0-9]+)?$ ]] && (( $(echo "$1 > 0" | bc -l 2>/dev/null || awk "{if($1>0) print 1; else print 0}") ))
+    local input=$1
+    # 1. 先用正则判断是不是纯数字或小数
+    if [[ ! "$input" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        return 1
+    fi
+    # 2. 使用 awk 的 BEGIN 模块直接计算，不需要读取 stdin，绝对不会卡死
+    awk -v val="$input" 'BEGIN { if (val > 0) exit 0; else exit 1 }'
 }
 
 # 暂停并按回车继续
@@ -100,18 +106,19 @@ set_limit() {
     
     # 允许小数输入
     read -p "请输入限制速率 (单位 MB/s, 支持小数, 如 0.5): " INPUT_MB
-    if ! validate_number "$INPUT_MB"; then echo "数值无效 (必须大于0)"; return; fi
+    
+    # 调用新的验证函数
+    if ! validate_number "$INPUT_MB"; then 
+        echo -e "${RED}错误：数值无效 (必须是大于0的数字)${PLAIN}"
+        pause
+        return
+    fi
     
     # --- 使用 AWK 进行浮点运算 ---
-    # LIMIT_KB: 将 MB 转换为 KB，取整数部分给 tc 使用
     local LIMIT_KB=$(awk -v val="$INPUT_MB" 'BEGIN {printf "%d", val * 1024}')
-    # SHOW_MBPS: 转换为 Mbps 用于显示
     local SHOW_MBPS=$(awk -v val="$INPUT_MB" 'BEGIN {printf "%.2f", val * 8}')
     
-    # 防止计算结果为 0 (例如输入 0.0001)
     if [ "$LIMIT_KB" -lt 1 ]; then LIMIT_KB=1; fi
-
-    # 物理带宽 1000MB/s (1Gbps)
     local PHY_LIMIT=$((1000 * 1024)) 
     
     remove_rules "quiet"
@@ -119,11 +126,7 @@ set_limit() {
     # --- TC 规则区 ---
     tc qdisc add dev "$INTERFACE" root handle 1: htb default 30
     tc class add dev "$INTERFACE" parent 1: classid 1:1 htb rate "${PHY_LIMIT}kbps" quantum 200000
-    
-    # 限速类
     tc class add dev "$INTERFACE" parent 1: classid 1:10 htb rate "${LIMIT_KB}kbps" ceil "${LIMIT_KB}kbps" burst 15k quantum 3000 prio 1
-    
-    # 默认畅通类
     tc class add dev "$INTERFACE" parent 1: classid 1:30 htb rate "${PHY_LIMIT}kbps" ceil "${PHY_LIMIT}kbps" burst 15k quantum 200000 prio 0
     
     tc filter add dev "$INTERFACE" protocol ip parent 1:0 prio 1 handle $MARK fw flowid 1:10
@@ -152,7 +155,6 @@ show_status() {
     if [ -f "$CONFIG_FILE" ]; then
         source "$CONFIG_FILE"
         echo "监听端口: $PORTS"
-        # 重新计算显示
         local CUR_MBPS=$(awk -v val="$LIMIT_MB" 'BEGIN {printf "%.2f", val * 8}')
         echo "限制速率: $LIMIT_MB MB/s (约 $CUR_MBPS Mbps)"
     else
@@ -180,10 +182,13 @@ main() {
     check_dependencies
     init_config
     
+    # 捕获 Ctrl+C 信号，防止脚本意外终止后残留
+    trap "exit 1" INT
+
     while true; do
         clear
         echo "=================================="
-        echo "    Linux 端口限速工具 (小数版)   "
+        echo "    Linux 端口限速工具 (v5 修复版)"
         echo "    当前网卡: $INTERFACE          "
         echo "=================================="
         echo " 1. 设置/更新 端口限速 (支持小数)"
