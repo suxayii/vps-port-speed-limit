@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # ==========================================
-# Linux 端口限速工具 (v6 - 终极防卡死版)
+# Linux 端口限速工具 (v6.1 - WARP/物理网卡修正版)
 # ==========================================
 
 CONFIG_DIR="/etc/port-limit"
@@ -9,8 +9,27 @@ CONFIG_FILE="$CONFIG_DIR/settings.conf"
 LOG_FILE="$CONFIG_DIR/port-limit.log"
 MARK=10
 
-# 自动获取网卡
-INTERFACE=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')
+# --- 核心修复：优化网卡识别逻辑 ---
+# 解释：优先匹配 eth/ens/enp/eno 开头的物理接口，避开 wgcf/tun/cloudflare 等虚拟接口
+detect_interface() {
+    # 1. 尝试直接通过名称获取物理网卡
+    local phy_iface=$(ip -o link show | awk -F': ' '{print $2}' | grep -E "^(eth|ens|enp|eno)[0-9]*" | head -n 1)
+    
+    if [ -n "$phy_iface" ]; then
+        echo "$phy_iface"
+    else
+        # 2. 如果没找到标准名称，尝试获取默认路由，但排除已知的虚拟网卡关键词
+        local route_iface=$(ip route get 8.8.8.8 2>/dev/null | awk '{print $5; exit}')
+        if [[ "$route_iface" =~ ^(wg|tun|ppp|cloudflare|utun) ]]; then
+            # 如果默认路由是虚拟卡，强制回退到 eth0 (绝大多数情况下的保底)
+            echo "eth0"
+        else
+            echo "$route_iface"
+        fi
+    fi
+}
+
+INTERFACE=$(detect_interface)
 [ -z "$INTERFACE" ] && INTERFACE="eth0"
 
 # 颜色
@@ -50,7 +69,6 @@ init_config() {
     touch "$LOG_FILE"
 }
 
-# --- 核心修复：添加 < /dev/null ---
 # 强制切断输入流，防止 awk 等待导致卡死
 validate_number() {
     local input=$1
@@ -84,7 +102,7 @@ remove_rules() {
         fi
     fi
     tc qdisc del dev "$INTERFACE" root 2>/dev/null
-    [ "$quiet" != "quiet" ] && log "旧规则已清理"
+    [ "$quiet" != "quiet" ] && log "旧规则已清理 (接口: $INTERFACE)"
 }
 
 add_firewall_rules() {
@@ -99,10 +117,10 @@ add_firewall_rules() {
 
 set_limit() {
     echo -e "${YELLOW}提示：设置将覆盖旧规则。${PLAIN}"
+    echo -e "当前操作网卡: ${GREEN}$INTERFACE${PLAIN} (请确认这是你的物理网卡)"
     read -p "请输入端口 (逗号分隔): " INPUT_PORTS
     [ -z "$INPUT_PORTS" ] && return
     
-    # 允许小数输入
     read -p "请输入限制速率 (单位 MB/s, 支持小数, 如 0.5): " INPUT_MB
     
     if ! validate_number "$INPUT_MB"; then 
@@ -111,7 +129,6 @@ set_limit() {
         return
     fi
     
-    # --- 修复核心：所有计算命令强制不等待输入 ---
     local LIMIT_KB=$(awk -v val="$INPUT_MB" 'BEGIN {printf "%d", val * 1024}' < /dev/null)
     local SHOW_MBPS=$(awk -v val="$INPUT_MB" 'BEGIN {printf "%.2f", val * 8}' < /dev/null)
     
@@ -140,7 +157,7 @@ PORTS=$INPUT_PORTS
 LIMIT_MB=$INPUT_MB
 EOF
     
-    log "已限速: 端口 [$INPUT_PORTS] -> $INPUT_MB MB/s ($LIMIT_KB KB/s)"
+    log "已限速: 端口 [$INPUT_PORTS] -> $INPUT_MB MB/s ($LIMIT_KB KB/s) @ $INTERFACE"
     echo -e "${GREEN}设置成功！${PLAIN}"
     echo -e "当前限制: ${YELLOW}$INPUT_MB MB/s${PLAIN} (约 $SHOW_MBPS Mbps)"
     
@@ -183,8 +200,8 @@ main() {
     while true; do
         clear
         echo "=================================="
-        echo "    Linux 端口限速工具 (v6)"
-        echo "    当前网卡: $INTERFACE          "
+        echo "    Linux 端口限速工具 (v6.1)"
+        echo "    当前操作网卡: ${GREEN}$INTERFACE${PLAIN}"
         echo "=================================="
         echo " 1. 设置/更新 端口限速 (支持小数)"
         echo " 2. 查看状态 (排查故障)"
